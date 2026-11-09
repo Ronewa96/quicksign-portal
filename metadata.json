@@ -1,0 +1,6 @@
+{
+  "name": "QuickSign Portal",
+  "description": "Upload, sign, send, and convert documents in one place, with AI summaries and a full record of who signed what.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

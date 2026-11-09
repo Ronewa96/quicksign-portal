@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>QuickSign</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg?v=2" />
+    <meta name="theme-color" content="#09090b" />
+    <meta name="description" content="Upload, sign, send, and convert documents in one place, with AI summaries and a full record of who signed what." />
+    <meta property="og:title" content="QuickSign Portal — Sign and Manage Documents" />
+    <meta property="og:description" content="Upload, sign, send, and convert documents in one place, with AI summaries and a full record of who signed what." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <script>
+      // Apply the saved theme before anything is drawn, on every page (see src/lib/theme.ts)
+      (function () {
+        var light = false;
+        try { light = localStorage.getItem('quicksign_theme_v2') === 'light'; } catch (e) {}
+        if (!light) document.documentElement.classList.add('dark');
+      })();
+    </script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Outfit:wght@300;400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+

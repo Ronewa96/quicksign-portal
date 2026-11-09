@@ -1,0 +1,8 @@
+{$SITE_ADDRESS} {
+	encode gzip
+	# Uploads of up to 50 MB documents
+	request_body {
+		max_size 60MB
+	}
+	reverse_proxy app:3000
+}

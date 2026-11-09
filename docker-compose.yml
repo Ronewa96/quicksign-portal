@@ -1,0 +1,30 @@
+# Run on the server with:  docker compose up -d --build
+# SITE_ADDRESS and the app settings come from the .env file next to this one.
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      # Users, sent documents and contacts live here and survive restarts and updates
+      - ./data:/app/data
+
+  caddy:
+    # Web server in front of the app: gets and renews the free HTTPS certificate automatically
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:
