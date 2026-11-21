@@ -158,6 +158,8 @@ export const SendDocumentView: React.FC = () => {
   const [signers, setSigners] = useState<SignerRow[]>(defaultSigners);
   // 'sequential': each person is emailed only after the person above them has signed
   const [signingOrder, setSigningOrder] = useState<'parallel' | 'sequential'>('parallel');
+  // The sender signs before anyone else; the others are emailed only after that
+  const [signFirst, setSignFirst] = useState(true);
 
   // Field errors are shown once the user has tried to continue from that step, then update as they type
   const [attempted, setAttempted] = useState({ document: false, signers: false });
@@ -169,7 +171,13 @@ export const SendDocumentView: React.FC = () => {
   // An uploaded PDF is kept and displayed exactly as-is; its text is only used for search / AI
   const [attachedPdf, setAttachedPdf] = useState<{ file: File; pages: string[] } | null>(null);
   const docErrors = validateDocument(title, content, Boolean(attachedPdf));
-  const signerErrors = validateSigners(signers);
+  const ownEmail = userProfile.email.trim().toLowerCase();
+  const isOwnRow = (s: SignerRow) => s.email.trim().toLowerCase() === ownEmail;
+  const baseSignerErrors = validateSigners(signers);
+  const signerErrors: SignerErrors =
+    signFirst && !signers.some((s) => !isBlankRow(s) && !isOwnRow(s))
+      ? { ...baseSignerErrors, list: 'Add at least one person to send it to after you sign.' }
+      : baseSignerErrors;
 
   // People this user has sent documents to before, suggested while typing
   const [contacts, setContacts] = useState<Contact[]>([]);
@@ -277,6 +285,15 @@ export const SendDocumentView: React.FC = () => {
     setContent('');
   };
 
+  const toggleSignFirst = (on: boolean) => {
+    setSignFirst(on);
+    setSigners((prev) => {
+      const others = prev.filter((s) => !isOwnRow(s));
+      if (on) return [{ name: userProfile.name, email: userProfile.email, role: userProfile.title || 'Sender' }, ...others];
+      return others.length ? others : [{ name: '', email: '', role: 'Other party' }];
+    });
+  };
+
   const addSignerRow = () => setSigners((prev) => [...prev, { name: '', email: '', role: 'Signer' }]);
   const removeSignerRow = (index: number) => setSigners((prev) => prev.filter((_, i) => i !== index));
 
@@ -367,6 +384,7 @@ export const SendDocumentView: React.FC = () => {
     setAttachedPdf(null);
     setSigners(defaultSigners());
     setSigningOrder('parallel');
+    setSignFirst(true);
     setAttempted({ document: false, signers: false });
   };
 
@@ -403,6 +421,7 @@ export const SendDocumentView: React.FC = () => {
         rawText: raw,
         signers: people,
         signingOrder: isSequential ? 'sequential' : 'parallel',
+        senderSignsFirst: signFirst,
         analysisId: includeSummary ? aiReview!.id : undefined,
       });
       if (attachedPdf) {
@@ -413,6 +432,11 @@ export const SendDocumentView: React.FC = () => {
         });
       }
       const result = await postJson(`/api/requests/${id}/send`);
+      if (signFirst && result.mySignToken) {
+        // Sign now; the others are emailed automatically as soon as this signature is saved
+        window.location.assign(`/sign/${result.mySignToken}`);
+        return;
+      }
       setSentTitle(title.trim());
       setSentWithSummary(includeSummary);
       setSendResult(result);
@@ -702,13 +726,28 @@ export const SendDocumentView: React.FC = () => {
                 </button>
               </div>
 
-              {signers.length > 1 && (
+              <label className="flex items-start gap-2.5 p-3 rounded border border-zinc-800 bg-zinc-900/60 cursor-pointer text-xs">
+                <input
+                  type="checkbox"
+                  checked={signFirst}
+                  onChange={(e) => toggleSignFirst(e.target.checked)}
+                  className="mt-0.5"
+                />
+                <span>
+                  <span className="block font-semibold text-white">I need to sign this first</span>
+                  <span className="block text-[11px] text-zinc-400 mt-0.5">
+                    You sign before anyone else. The others are emailed only after you've signed.
+                  </span>
+                </span>
+              </label>
+
+              {signers.length > (signFirst ? 2 : 1) && (
                 <div className="space-y-1.5">
-                  <div className="text-xs font-medium text-zinc-400">Signing order</div>
+                  <div className="text-xs font-medium text-zinc-400">{signFirst ? 'After you sign' : 'Signing order'}</div>
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-2" role="radiogroup" aria-label="Signing order">
                     {([
-                      ['parallel', 'Everyone at once', 'All signers are emailed now and can sign in any order.'],
-                      ['sequential', 'One after another', 'Signers sign in the order below. Each person is emailed only after the one above has signed.'],
+                      ['parallel', 'Everyone at once', signFirst ? 'Everyone is emailed as soon as you sign, and can sign in any order.' : 'All signers are emailed now and can sign in any order.'],
+                      ['sequential', 'One after another', signFirst ? 'They sign in the order below, after you. Each person is emailed when it is their turn.' : 'Signers sign in the order below. Each person is emailed only after the one above has signed.'],
                     ] as const).map(([value, label, hint]) => (
                       <button
                         key={value}
@@ -731,14 +770,15 @@ export const SendDocumentView: React.FC = () => {
               <div className="space-y-3">
                 {signers.map((signer, index) => {
                   const rowErrors = showSignerErrors ? signerErrors.rows[index] || {} : {};
+                  const locked = signFirst && index === 0;
                   return (
                     <div key={index} className="p-3 bg-zinc-900/60 border border-zinc-800 rounded flex flex-col md:flex-row md:items-start gap-3">
                       <div className="flex md:flex-col items-center gap-1 shrink-0 md:pt-0.5">
-                        {signingOrder === 'sequential' && signers.length > 1 && (
+                        {signingOrder === 'sequential' && signers.length > 1 && !locked && (
                           <button
                             type="button"
                             onClick={() => moveSigner(index, -1)}
-                            disabled={index === 0}
+                            disabled={index === (signFirst ? 1 : 0)}
                             className="p-0.5 text-zinc-500 hover:text-white disabled:opacity-20 cursor-pointer disabled:cursor-default"
                             title="Move up"
                             aria-label={`Move signer ${index + 1} up`}
@@ -749,7 +789,7 @@ export const SendDocumentView: React.FC = () => {
                         <div className="w-6 h-6 rounded-full bg-zinc-800 flex items-center justify-center text-xs font-mono text-zinc-400">
                           {index + 1}
                         </div>
-                        {signingOrder === 'sequential' && signers.length > 1 && (
+                        {signingOrder === 'sequential' && signers.length > 1 && !locked && (
                           <button
                             type="button"
                             onClick={() => moveSigner(index, 1)}
@@ -772,7 +812,8 @@ export const SendDocumentView: React.FC = () => {
                               type="text"
                               value={signer.name}
                               onChange={(e) => updateSigner(index, 'name', e.target.value)}
-                              list="contact-names"
+                              readOnly={locked}
+                              list={locked ? undefined : 'contact-names'}
                               autoComplete="off"
                               placeholder="Signer Full Name"
                               aria-label={`Signer ${index + 1} name`}
@@ -791,7 +832,8 @@ export const SendDocumentView: React.FC = () => {
                               type="email"
                               value={signer.email}
                               onChange={(e) => updateSigner(index, 'email', e.target.value)}
-                              list="contact-emails"
+                              readOnly={locked}
+                              list={locked ? undefined : 'contact-emails'}
                               autoComplete="off"
                               placeholder="name@company.com"
                               aria-label={`Signer ${index + 1} email`}
@@ -812,7 +854,12 @@ export const SendDocumentView: React.FC = () => {
                         />
                       </div>
 
-                      {signers.length > 1 && (
+                      {locked && (
+                        <span className="self-end md:self-start md:pt-1.5 text-[10px] uppercase font-semibold text-cyan-300 whitespace-nowrap">
+                          You · sign first
+                        </span>
+                      )}
+                      {signers.length > 1 && !locked && (
                         <button
                           type="button"
                           onClick={() => removeSignerRow(index)}
@@ -874,7 +921,13 @@ export const SendDocumentView: React.FC = () => {
                 </dd>
                 <dt className="text-zinc-500">Signing order</dt>
                 <dd className="text-zinc-200">
-                  {isSequential ? 'One after another, in the order below' : people.length > 1 ? 'Everyone at once' : 'One signer'}
+                  {signFirst
+                    ? `You sign first, then ${people.length > 2 ? (isSequential ? 'the others one after another' : 'everyone else at once') : 'it goes to the other person'}`
+                    : isSequential
+                    ? 'One after another, in the order below'
+                    : people.length > 1
+                    ? 'Everyone at once'
+                    : 'One signer'}
                 </dd>
               </dl>
 
@@ -891,7 +944,17 @@ export const SendDocumentView: React.FC = () => {
                       {p.role && <span className="text-zinc-500">· {p.role}</span>}
                       {isMe(p.email) && <span className="text-[10px] uppercase font-semibold text-cyan-300">You</span>}
                       <span className="ml-auto text-[11px] text-zinc-500">
-                        {isSequential && i > 0 ? `Emailed after ${people[i - 1].name} signs` : isMe(p.email) ? 'Signs from the next screen' : 'Emailed now'}
+                        {signFirst
+                          ? i === 0
+                            ? 'You sign first, on the next screen'
+                            : isSequential && i > 1
+                            ? `Emailed after ${people[i - 1].name} signs`
+                            : 'Emailed after you sign'
+                          : isSequential && i > 0
+                          ? `Emailed after ${people[i - 1].name} signs`
+                          : isMe(p.email)
+                          ? 'Signs from the next screen'
+                          : 'Emailed now'}
                       </span>
                     </li>
                   ))}
@@ -1041,8 +1104,22 @@ export const SendDocumentView: React.FC = () => {
                   title={needsRiskConfirmation ? 'Confirm the high-risk items above first' : undefined}
                   className="flex items-center gap-1.5 px-5 py-2 bg-white text-zinc-950 hover:bg-zinc-200 text-xs font-semibold rounded shadow cursor-pointer disabled:opacity-40"
                 >
-                  {isSubmitting ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
-                  <span>{isSubmitting ? 'Sending…' : `Send to ${people.length} Signer${people.length === 1 ? '' : 's'}`}</span>
+                  {isSubmitting ? (
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                  ) : signFirst ? (
+                    <PenTool className="w-3.5 h-3.5" />
+                  ) : (
+                    <Send className="w-3.5 h-3.5" />
+                  )}
+                  <span>
+                    {isSubmitting
+                      ? signFirst
+                        ? 'Opening…'
+                        : 'Sending…'
+                      : signFirst
+                      ? 'Sign and Send'
+                      : `Send to ${people.length} Signer${people.length === 1 ? '' : 's'}`}
+                  </span>
                 </button>
               </>
             )}

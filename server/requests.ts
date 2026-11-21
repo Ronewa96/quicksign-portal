@@ -5,6 +5,7 @@ import path from 'path';
 import { AuthedRequest } from './auth';
 import { sendMail, emailLayout, isEmailConfigured, publicAppUrl, MailResult } from './mailer';
 import { analysisForDocument } from './ai';
+import { readLocation, describeLocation } from './location';
 import {
   AiSummary,
   Signer,
@@ -18,6 +19,7 @@ import {
   rememberContactRecords,
   requestsSentBy,
   saveRequestRecord,
+  LocationRecord,
 } from './db';
 
 // Documents sent to other people for signing, available to every signer through a private link
@@ -55,7 +57,7 @@ function rememberContacts(userId: string, people: Array<{ name: string; email: s
 
 const newId = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${crypto.randomBytes(3).toString('hex')}`;
 
-function audit(request: SignRequest, req: Request, action: string, actor: string, details: string) {
+function audit(request: SignRequest, req: Request, action: string, actor: string, details: string, location?: LocationRecord) {
   request.auditTrail.push({
     id: newId('aud'),
     timestamp: new Date().toISOString(),
@@ -64,6 +66,7 @@ function audit(request: SignRequest, req: Request, action: string, actor: string
     details,
     ipAddress: req.ip || 'unknown',
     deviceInfo: String(req.headers['user-agent'] || 'unknown').slice(0, 200),
+    ...(location ? { location } : {}),
   });
 }
 
@@ -74,9 +77,16 @@ const isSequential = (request: SignRequest) => request.signingOrder === 'sequent
 /** The signer whose turn it is in a sequential request (the first one who hasn't signed). */
 const currentSigner = (request: SignRequest) => request.signers.find((s) => s.status === 'pending');
 
+/** True while the sender has chosen to sign first and hasn't signed yet: nobody else can sign. */
+const senderStillFirst = (request: SignRequest) =>
+  !!request.senderSignsFirst && request.signers.some((s) => s.email === request.sender.email && s.status === 'pending');
+
 /** Whether this signer may sign now: always in parallel mode, only on their turn in sequential mode. */
 const isTurn = (request: SignRequest, signer: Signer) =>
-  request.status === 'pending' && signer.status === 'pending' && (!isSequential(request) || currentSigner(request) === signer);
+  request.status === 'pending' &&
+  signer.status === 'pending' &&
+  (!senderStillFirst(request) || signer.email === request.sender.email) &&
+  (!isSequential(request) || currentSigner(request) === signer);
 
 const MAX_DECLINE_REASON = 1000;
 
@@ -108,8 +118,18 @@ function signerView(request: SignRequest, signer: Signer) {
     declinedAt: request.declinedAt,
     hasSignedPdf: request.hasSignedPdf,
     sender: { name: request.sender.name, email: request.sender.email },
-    me: { id: signer.id, name: signer.name, email: signer.email, role: signer.role, status: signer.status },
+    me: {
+      id: signer.id,
+      name: signer.name,
+      email: signer.email,
+      role: signer.role,
+      status: signer.status,
+      // The signer can see their own recorded location; other signers' locations are not shown to them
+      viewLocation: signer.viewLocation,
+    },
     signingOrder: request.signingOrder || 'parallel',
+    senderSignsFirst: !!request.senderSignsFirst,
+    isSender: signer.email === request.sender.email,
     myTurn: isTurn(request, signer),
     waitingFor:
       request.status === 'pending' && !isTurn(request, signer) && signer.status === 'pending' ? currentSigner(request)?.name : undefined,
@@ -193,13 +213,25 @@ export function createRequestsRouter() {
   // Step 1: create the request (document text + signers)
   router.post('/', (req: AuthedRequest, res) => {
     const { title, category = 'Other', pages = [], rawText = '', signers = [], signingOrder, analysisId } = req.body || {};
-    const cleanSigners = (Array.isArray(signers) ? signers : [])
+    const senderSignsFirst = req.body?.senderSignsFirst === true;
+    let cleanSigners = (Array.isArray(signers) ? signers : [])
       .map((s: any) => ({
         name: String(s?.name || '').trim(),
         email: String(s?.email || '').trim().toLowerCase(),
         role: String(s?.role || '').trim(),
       }))
       .filter((s) => s.name || s.email);
+
+    // Signing first: the sender goes to the top of the list, and there must be someone to send it to afterwards
+    if (senderSignsFirst) {
+      const ownEmail = req.user!.email.toLowerCase();
+      const own = cleanSigners.find((s) => s.email === ownEmail);
+      cleanSigners = [
+        { name: req.user!.name, email: ownEmail, role: own?.role || 'Sender' },
+        ...cleanSigners.filter((s) => s.email !== ownEmail),
+      ];
+      if (cleanSigners.length < 2) return res.status(400).json({ error: 'Add at least one person to send it to after you sign.' });
+    }
 
     if (!String(title || '').trim()) return res.status(400).json({ error: 'A document title is required.' });
     if (cleanSigners.length === 0) return res.status(400).json({ error: 'Add at least one signer.' });
@@ -240,6 +272,7 @@ export function createRequestsRouter() {
       rawText: String(rawText),
       hasOriginal: false,
       signingOrder: signingOrder === 'sequential' && cleanSigners.length > 1 ? 'sequential' : 'parallel',
+      senderSignsFirst: senderSignsFirst || undefined,
       signers: cleanSigners.map((s) => ({ ...s, id: newId('sgn'), token: crypto.randomBytes(24).toString('hex'), status: 'pending' as const })),
       tags: [],
       auditTrail: [],
@@ -252,7 +285,9 @@ export function createRequestsRouter() {
       req,
       'Document created',
       `${req.user!.name} (${req.user!.email})`,
-      `Prepared for ${cleanSigners.length} signer(s)${isSequential(request) ? `, signing in order: ${cleanSigners.map((s) => s.name).join(' → ')}` : ''}.`
+      `Prepared for ${cleanSigners.length} signer(s)${isSequential(request) ? `, signing in order: ${cleanSigners.map((s) => s.name).join(' → ')}` : ''}.${
+        senderSignsFirst ? ' The sender signs first; the others are emailed after that.' : ''
+      }`
     );
     if (aiSummary) {
       audit(
@@ -317,14 +352,20 @@ export function createRequestsRouter() {
         ],
         button: senderCanSignNow ? { label: 'Sign your part', url: signUrl(req, senderSigner!.token) } : undefined,
       });
-      results.push(await sendMail({ to: request.sender.email, subject: `Sent for signing: ${request.title}`, ...confirmation }));
+      // Signing first: the sender is signing in their browser right now, and nobody has been emailed yet
+      if (!request.senderSignsFirst) {
+        results.push(await sendMail({ to: request.sender.email, subject: `Sent for signing: ${request.title}`, ...confirmation }));
+      }
 
+      const others = request.signers.filter((s) => s !== senderSigner).map((s) => `${s.name} (${s.email})`).join(', ');
       audit(
         request,
         req,
-        'Sent for signing',
+        request.senderSignsFirst ? 'Ready for sender to sign' : 'Sent for signing',
         `${request.sender.name} (${request.sender.email})`,
-        sequential
+        request.senderSignsFirst
+          ? `The sender signs first. ${sequential ? `Then in order: ${order}.` : `Then emailed to ${others}.`}`
+          : sequential
           ? `Signing in order: ${order}. First request emailed to ${emailNow.map((s) => `${s.name} (${s.email})`).join(', ') || request.sender.name}.`
           : `Signing requests emailed to ${names}.`
       );
@@ -414,6 +455,24 @@ export function createPublicSignRouter() {
     res.json(signerView(request, signer));
   }));
 
+  // Location when the signer opened the document: shared, or a note that it wasn't. Recorded once.
+  router.post('/:token/location', withSigner(async (req, res, request, signer) => {
+    if (signer.viewLocation) return res.json({ location: signer.viewLocation, alreadyRecorded: true });
+    const location = await readLocation(req.body?.location, req.ip || '');
+    if (!location) return res.status(400).json({ error: 'The location details are not valid.' });
+    signer.viewLocation = location;
+    const details = location.shared
+      ? `Shared their location when opening the document: ${describeLocation(location)}.`
+      : location.reason === 'unavailable'
+      ? 'Location was not available on their device when opening the document.'
+      : location.reason === 'declined'
+      ? 'Chose not to share their location when opening the document.'
+      : 'Did not share their location when opening the document.';
+    audit(request, req, location.shared ? 'Location shared' : 'Location not shared', `${signer.name} (${signer.email})`, details, location);
+    saveRequest(request);
+    res.json({ location });
+  }));
+
   router.get('/:token/original', withSigner((_req, res, request) => {
     if (!request.hasOriginal) return res.status(404).json({ error: 'No original file.' });
     res.type('application/pdf').sendFile(originalFile(request.id));
@@ -436,6 +495,7 @@ export function createPublicSignRouter() {
       return res.status(400).json({ error: `It isn't your turn yet. ${currentSigner(request)?.name || 'Someone else'} needs to sign first.` });
     }
     const incoming: any[] = Array.isArray(req.body?.tags) ? req.body.tags : [];
+    const location = await readLocation(req.body?.location, req.ip || '');
     const now = new Date().toISOString();
     const tags: Tag[] = incoming
       .filter((t) => ['signature', 'date', 'nameTag', 'initials'].includes(t?.type))
@@ -463,7 +523,15 @@ export function createPublicSignRouter() {
     request.tags.push(...tags);
     signer.status = 'signed';
     signer.signedAt = now;
-    audit(request, req, 'Signed', `${signer.name} (${signer.email})`, `Signed with ${tags.length} item(s) placed on the document.`);
+    if (location) signer.signLocation = location;
+    audit(
+      request,
+      req,
+      'Signed',
+      `${signer.name} (${signer.email})`,
+      `Signed with ${tags.length} item(s) placed on the document. Location: ${describeLocation(location)}.`,
+      location
+    );
 
     const signedCount = request.signers.filter((s) => s.status === 'signed').length;
     const allSigned = signedCount === request.signers.length;
@@ -476,7 +544,20 @@ export function createPublicSignRouter() {
 
     // Pass the document on to the next person in line
     const next = !allSigned && isSequential(request) ? currentSigner(request) : undefined;
-    if (next) await notifyNextSigner(req, request);
+    if (next) {
+      await notifyNextSigner(req, request);
+    } else if (!allSigned && request.senderSignsFirst && signer.email === request.sender.email) {
+      // The sender has signed first: now everyone else gets their link
+      const others = request.signers.filter((s) => s.status === 'pending');
+      for (const person of others) await sendSignRequestEmail(req, request, person);
+      audit(
+        request,
+        req,
+        'Sent for signing',
+        `${request.sender.name} (${request.sender.email})`,
+        `Signed first, then emailed signing requests to ${others.map((s) => `${s.name} (${s.email})`).join(', ')}.`
+      );
+    }
     saveRequest(request);
 
     // Let the sender know (unless they just signed it themselves)
@@ -511,13 +592,22 @@ export function createPublicSignRouter() {
     }
 
     const reason = String(req.body?.reason || '').trim().slice(0, MAX_DECLINE_REASON);
+    const location = await readLocation(req.body?.location, req.ip || '');
     const now = new Date().toISOString();
     signer.status = 'declined';
     signer.declinedAt = now;
     signer.declineReason = reason || undefined;
+    if (location) signer.signLocation = location;
     request.status = 'declined';
     request.declinedAt = now;
-    audit(request, req, 'Declined', `${signer.name} (${signer.email})`, reason ? `Declined to sign. Reason: ${reason}` : 'Declined to sign. No reason given.');
+    audit(
+      request,
+      req,
+      'Declined',
+      `${signer.name} (${signer.email})`,
+      `${reason ? `Declined to sign. Reason: ${reason}` : 'Declined to sign. No reason given.'} Location: ${describeLocation(location)}.`,
+      location
+    );
     saveRequest(request);
 
     const reasonLine = reason ? `Their reason: "${reason}"` : 'They did not give a reason.';

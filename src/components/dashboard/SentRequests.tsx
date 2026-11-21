@@ -11,6 +11,8 @@ interface SentRequest {
   hasSignedPdf: boolean;
   mySignToken?: string;
   signingOrder?: 'parallel' | 'sequential';
+  /** The sender signs before anyone else is emailed */
+  senderSignsFirst?: boolean;
   /** In a sequential request: whose turn it is */
   currentSignerId?: string;
   signers: Array<{
@@ -111,15 +113,22 @@ export const SentRequests: React.FC = () => {
                         : 'bg-cyan-500/10 text-cyan-300'
                     }`}
                   >
-                    {r.status === 'completed' ? 'Completed' : r.status === 'declined' ? 'Declined' : 'Waiting'}
+                    {r.status === 'completed'
+                      ? 'Completed'
+                      : r.status === 'declined'
+                      ? 'Declined'
+                      : r.senderSignsFirst && r.mySignToken
+                      ? 'Not sent yet'
+                      : 'Waiting'}
                   </span>
                   {r.mySignToken && (
                     <a
                       href={`/sign/${r.mySignToken}`}
                       className="flex items-center gap-1 px-2.5 py-1 bg-white text-zinc-950 font-semibold text-[11px] rounded hover:bg-zinc-200"
+                      title={r.senderSignsFirst ? 'Sign it, and it is sent to the others straight away' : undefined}
                     >
                       <PenTool className="w-3 h-3" />
-                      <span>Sign my part</span>
+                      <span>{r.senderSignsFirst ? 'Sign and send' : 'Sign my part'}</span>
                     </a>
                   )}
                   {r.hasSignedPdf && (

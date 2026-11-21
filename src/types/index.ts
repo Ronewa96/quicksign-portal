@@ -1,3 +1,5 @@
+import type { LocationRecord } from '../lib/location';
+
 export type DocumentStatus = 'draft' | 'pending' | 'signed' | 'completed';
 
 export type TagType = 'signature' | 'initials' | 'date' | 'nameTag';
@@ -25,6 +27,8 @@ export interface AuditEvent {
   details: string;
   ipAddress: string;
   deviceInfo: string;
+  /** Where the person was, if they shared it (optional) */
+  location?: LocationRecord;
 }
 
 export interface QuickDocument {
@@ -50,6 +54,7 @@ export interface QuickDocument {
     role: string;
     status: 'pending' | 'signed';
     signedAt?: string;
+    signLocation?: LocationRecord;
   }>;
   signatureTags: SignatureTag[];
   auditTrail: AuditEvent[];

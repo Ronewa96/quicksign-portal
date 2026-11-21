@@ -8,6 +8,7 @@ import { createConvertRouter } from './server/convert';
 import { createRequestsRouter, createContactsRouter, createPublicSignRouter } from './server/requests';
 import { createAiRouter, isAiConfigured } from './server/ai';
 import { isEmailConfigured } from './server/mailer';
+import { readLocation } from './server/location';
 
 const isProduction = process.env.NODE_ENV === 'production';
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -52,9 +53,10 @@ async function startServer() {
   });
 
   // Signature record: transaction ID and SHA-256 fingerprint
-  app.post('/api/audit/seal', (req, res) => {
+  app.post('/api/audit/seal', async (req, res) => {
     try {
       const { documentId, documentTitle, signerName, signerEmail, signatureData } = req.body;
+      const location = await readLocation(req.body?.location, req.ip || '');
 
       const rawPayload = `${documentId || ''}:${signerName || ''}:${signerEmail || ''}:${Date.now()}:${signatureData || ''}`;
       const sha256Hash = crypto.createHash('sha256').update(rawPayload).digest('hex');
@@ -67,6 +69,8 @@ async function startServer() {
         timestamp: new Date().toISOString(),
         verified: true,
         verificationUrl: `/audit?tx=${txId}`,
+        ipAddress: req.ip || 'unknown',
+        location,
       });
     } catch (err: any) {
       res.status(500).json({ error: 'Failed to record signature' });

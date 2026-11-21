@@ -14,6 +14,7 @@ Upload, sign, send, and convert documents in one place, with AI summaries and a 
 - Upload a file (PDF, Word, text, Markdown, HTML, or JSON) or paste the text.
 - Add the people who need to sign, then send it or sign it yourself.
 - An AI review suggests the category, summarises the document for the signers, and asks you to confirm high-risk items.
+- Signers can choose to share their location when they open, sign or decline. It appears in the audit trail and certificate with a place name from OpenStreetMap. Sharing is optional.
 - Signers get a private link by email and can sign or decline. Everyone receives the signed PDF. Without SMTP settings, emails are saved to `data/outbox`.
 
 ### View documents

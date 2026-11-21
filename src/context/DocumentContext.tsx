@@ -4,6 +4,7 @@ import { AuthUser } from './AuthContext';
 import { deleteOriginalFile } from '../lib/fileStore';
 import { forgetStoredPdf } from '../lib/pdf';
 import { useTheme } from '../lib/theme';
+import { requestLocation, withApproximate, LocationRecord } from '../lib/location';
 
 export type NavigationTab = 'dashboard' | 'send' | 'viewer' | 'convert' | 'ai' | 'audit' | 'settings' | 'dedicatedSign';
 
@@ -153,7 +154,7 @@ export const DocumentProvider: React.FC<{ authUser: AuthUser; children: React.Re
           action: 'Document uploaded',
           actor: userProfile.name,
           details: 'Document uploaded and ready to view.',
-          ipAddress: '127.0.0.1 (Local Client)',
+          ipAddress: 'Not recorded (this device)',
           deviceInfo: navigator.userAgent,
         },
       ],
@@ -216,7 +217,7 @@ export const DocumentProvider: React.FC<{ authUser: AuthUser; children: React.Re
             action: `Signature Tag Placed for ${tag.signerName}`,
             actor: userProfile.name,
             details: `Tag type '${tag.type}' placed on page ${tag.pageIndex + 1} at coordinates (${Math.round(tag.x)}%, ${Math.round(tag.y)}%).`,
-            ipAddress: '127.0.0.1',
+            ipAddress: 'Not recorded (this device)',
             deviceInfo: 'QuickSign UI',
           };
           return {
@@ -275,6 +276,11 @@ export const DocumentProvider: React.FC<{ authUser: AuthUser; children: React.Re
       .map((b) => b.toString(16).padStart(2, '0'))
       .join('');
 
+    // Optional: where the signer is. The browser asks first, and signing continues either way.
+    const locationAnswer = withApproximate(await requestLocation(15000));
+    let location: LocationRecord | undefined;
+    let ipAddress = 'Not recorded';
+
     try {
       const res = await fetch('/api/audit/seal', {
         method: 'POST',
@@ -285,12 +291,15 @@ export const DocumentProvider: React.FC<{ authUser: AuthUser; children: React.Re
           signerName: nameToUse,
           signerEmail: userProfile.email,
           signatureData: signatureDataUrl.slice(0, 100),
+          location: locationAnswer,
         }),
       });
       if (res.ok) {
         const data = await res.json();
         txId = data.transactionId;
         shaHash = data.sha256Hash;
+        location = data.location;
+        if (data.ipAddress) ipAddress = data.ipAddress;
       }
     } catch (e) {
       console.warn('Server sealing fallback:', e);
@@ -320,7 +329,7 @@ export const DocumentProvider: React.FC<{ authUser: AuthUser; children: React.Re
 
           const updatedSigners = d.signers.map((s) => {
             if (s.name.toLowerCase() === nameToUse.toLowerCase() || s.email === userProfile.email) {
-              return { ...s, status: 'signed' as const, signedAt: timestamp };
+              return { ...s, status: 'signed' as const, signedAt: timestamp, ...(location ? { signLocation: location } : {}) };
             }
             return s;
           });
@@ -331,8 +340,9 @@ export const DocumentProvider: React.FC<{ authUser: AuthUser; children: React.Re
             action: 'Document signed',
             actor: `${nameToUse} (${userProfile.email})`,
             details: `Signature applied. Transaction ID ${txId}.`,
-            ipAddress: '198.51.100.24',
+            ipAddress,
             deviceInfo: navigator.userAgent,
+            ...(location ? { location } : {}),
           };
 
           return {

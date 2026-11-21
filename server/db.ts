@@ -25,6 +25,19 @@ export interface StoredUser {
   avatarUpdatedAt?: string;
 }
 
+/** Where someone was when they opened, signed or declined. Sharing is optional. */
+export type LocationRecord =
+  | {
+      shared: true;
+      latitude: number;
+      longitude: number;
+      accuracy: number;
+      place?: string;
+      /** 'device': from the browser (GPS or Wi-Fi). 'network': approximate, from the internet address. */
+      source?: 'device' | 'network';
+    }
+  | { shared: false; reason: 'declined' | 'unavailable' | 'skipped' };
+
 export interface Signer {
   id: string;
   name: string;
@@ -37,6 +50,10 @@ export interface Signer {
   declinedAt?: string;
   /** Optional note from the signer explaining why they declined */
   declineReason?: string;
+  /** Location when they opened the document (recorded once) */
+  viewLocation?: LocationRecord;
+  /** Location when they signed or declined */
+  signLocation?: LocationRecord;
 }
 
 export interface Tag {
@@ -61,6 +78,7 @@ export interface AuditEvent {
   details: string;
   ipAddress: string;
   deviceInfo: string;
+  location?: LocationRecord;
 }
 
 export interface AiSummary {
@@ -84,6 +102,8 @@ export interface SignRequest {
   pages: string[];
   rawText: string;
   hasOriginal: boolean;
+  /** The sender signs before anyone else; the others are emailed only after that */
+  senderSignsFirst?: boolean;
   /** 'sequential': signers sign one after another in list order */
   signingOrder?: 'parallel' | 'sequential';
   signers: Signer[];
@@ -218,6 +238,26 @@ db.exec(`
   );
 `);
 
+/** Adds a column to an existing database the first time a newer version of QuickSign starts. */
+function addColumnIfMissing(table: string, column: string, type: string) {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  if (!columns.some((c) => c.name === column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+}
+addColumnIfMissing('signers', 'view_location', 'TEXT');
+addColumnIfMissing('signers', 'sign_location', 'TEXT');
+addColumnIfMissing('audit_events', 'location', 'TEXT');
+addColumnIfMissing('requests', 'sender_signs_first', 'INTEGER NOT NULL DEFAULT 0');
+
+const toJson = (value: unknown) => (value === undefined || value === null ? null : JSON.stringify(value));
+const fromJson = (value: string | null | undefined) => {
+  if (!value) return undefined;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return undefined;
+  }
+};
+
 let transactionDepth = 0;
 
 /** Runs the work as one all-or-nothing transaction. An error undoes everything it changed. */
@@ -298,6 +338,7 @@ function toRequest(row: any): SignRequest {
     rawText: row.raw_text,
     hasOriginal: Boolean(row.has_original),
     signingOrder: row.signing_order,
+    senderSignsFirst: Boolean(row.sender_signs_first),
     status: row.status,
     transactionId: orUndefined(row.transaction_id),
     completedAt: orUndefined(row.completed_at),
@@ -316,6 +357,8 @@ function toRequest(row: any): SignRequest {
       signedAt: orUndefined(s.signed_at),
       declinedAt: orUndefined(s.declined_at),
       declineReason: orUndefined(s.decline_reason),
+      viewLocation: fromJson(s.view_location),
+      signLocation: fromJson(s.sign_location),
     })),
     tags: tags.map((t) => ({
       id: t.id,
@@ -338,6 +381,7 @@ function toRequest(row: any): SignRequest {
       details: e.details,
       ipAddress: e.ip_address,
       deviceInfo: e.device_info,
+      location: fromJson(e.location),
     })),
   };
 }
@@ -367,13 +411,15 @@ export function saveRequestRecord(request: SignRequest) {
   transaction(() => {
     db.prepare(
       `INSERT INTO requests (id, sender_user_id, sender_name, sender_email, title, category, status, signing_order, pages, raw_text,
-         has_original, has_signed_pdf, created_at, updated_at, sent_at, completed_at, declined_at, transaction_id, sha256_hash, ai_summary)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         has_original, has_signed_pdf, created_at, updated_at, sent_at, completed_at, declined_at, transaction_id, sha256_hash, ai_summary,
+         sender_signs_first)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET
          title = excluded.title, category = excluded.category, status = excluded.status, signing_order = excluded.signing_order,
          pages = excluded.pages, raw_text = excluded.raw_text, has_original = excluded.has_original, has_signed_pdf = excluded.has_signed_pdf,
          updated_at = excluded.updated_at, sent_at = excluded.sent_at, completed_at = excluded.completed_at, declined_at = excluded.declined_at,
-         transaction_id = excluded.transaction_id, sha256_hash = excluded.sha256_hash, ai_summary = excluded.ai_summary`
+         transaction_id = excluded.transaction_id, sha256_hash = excluded.sha256_hash, ai_summary = excluded.ai_summary,
+         sender_signs_first = excluded.sender_signs_first`
     ).run(
       request.id,
       request.sender.userId,
@@ -394,16 +440,19 @@ export function saveRequestRecord(request: SignRequest) {
       orNull(request.declinedAt),
       orNull(request.transactionId),
       orNull(request.sha256Hash),
-      request.aiSummary ? JSON.stringify(request.aiSummary) : null
+      request.aiSummary ? JSON.stringify(request.aiSummary) : null,
+      request.senderSignsFirst ? 1 : 0
     );
 
     db.prepare('DELETE FROM signers WHERE request_id = ?').run(request.id);
     const insertSigner = db.prepare(
-      `INSERT INTO signers (id, request_id, position, name, email, role, token, status, viewed_at, signed_at, declined_at, decline_reason)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO signers (id, request_id, position, name, email, role, token, status, viewed_at, signed_at, declined_at, decline_reason,
+         view_location, sign_location)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     request.signers.forEach((s, i) =>
-      insertSigner.run(s.id, request.id, i, s.name, s.email, s.role, s.token, s.status, orNull(s.viewedAt), orNull(s.signedAt), orNull(s.declinedAt), orNull(s.declineReason))
+      insertSigner.run(s.id, request.id, i, s.name, s.email, s.role, s.token, s.status, orNull(s.viewedAt), orNull(s.signedAt), orNull(s.declinedAt), orNull(s.declineReason),
+        toJson(s.viewLocation), toJson(s.signLocation))
     );
 
     db.prepare('DELETE FROM tags WHERE request_id = ?').run(request.id);
@@ -417,10 +466,10 @@ export function saveRequestRecord(request: SignRequest) {
 
     db.prepare('DELETE FROM audit_events WHERE request_id = ?').run(request.id);
     const insertEvent = db.prepare(
-      `INSERT INTO audit_events (id, request_id, position, timestamp, action, actor, details, ip_address, device_info)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO audit_events (id, request_id, position, timestamp, action, actor, details, ip_address, device_info, location)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
-    request.auditTrail.forEach((e, i) => insertEvent.run(e.id, request.id, i, e.timestamp, e.action, e.actor, e.details, e.ipAddress, e.deviceInfo));
+    request.auditTrail.forEach((e, i) => insertEvent.run(e.id, request.id, i, e.timestamp, e.action, e.actor, e.details, e.ipAddress, e.deviceInfo, toJson(e.location)));
   });
 }
 

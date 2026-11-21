@@ -5,6 +5,8 @@ import { buildSignedPdf } from '../../lib/signedPdf';
 import { downloadBlob, safeFileName } from '../../lib/textPdf';
 import { useElementWidth, fitScale } from '../../lib/useElementWidth';
 import { ThemeToggle } from '../common/ThemeToggle';
+import { LocationText } from '../common/LocationText';
+import { LocationAnswer, LocationRecord, locationForAction, locationPermission, requestLocation, withApproximate } from '../../lib/location';
 import { QuickDocument, SignatureTag } from '../../types';
 import {
   ArrowLeft,
@@ -21,6 +23,7 @@ import {
   Plus,
   Users,
   XCircle,
+  MapPin,
 } from 'lucide-react';
 
 type SignerStatus = 'pending' | 'signed' | 'declined';
@@ -37,10 +40,13 @@ interface SignView {
   declinedAt?: string;
   hasSignedPdf: boolean;
   sender: { name: string; email: string };
-  me: { id: string; name: string; email: string; role: string; status: SignerStatus };
+  me: { id: string; name: string; email: string; role: string; status: SignerStatus; viewLocation?: LocationRecord };
   signers: Array<{ name: string; email: string; role: string; status: SignerStatus; signedAt?: string; declineReason?: string }>;
   tags: SignatureTag[];
   signingOrder?: 'parallel' | 'sequential';
+  /** The sender signs before anyone else is emailed */
+  senderSignsFirst?: boolean;
+  isSender?: boolean;
   /** False when someone earlier in the signing order still has to sign */
   myTurn?: boolean;
   waitingFor?: string;
@@ -187,6 +193,59 @@ export const PublicSigningPage: React.FC<{ token: string }> = ({ token }) => {
     return () => clearTimeout(timer);
   }, [returnIn]);
 
+  // Optional location for the signing record, asked once when the document is opened
+  const [viewLocation, setViewLocation] = useState<LocationRecord | undefined>(undefined);
+  const [askLocation, setAskLocation] = useState(false);
+  const [locationBusy, setLocationBusy] = useState(false);
+  const locationChecked = useRef(false);
+
+  const recordViewLocation = async (answer: LocationAnswer) => {
+    try {
+      const res = await fetch(`/api/sign/${token}/location`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ location: answer }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.location) setViewLocation(data.location);
+    } catch {
+      // Location is optional: never block viewing or signing because it couldn't be saved
+    } finally {
+      setAskLocation(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!view || locationChecked.current) return;
+    locationChecked.current = true;
+    if (view.me.viewLocation) {
+      setViewLocation(view.me.viewLocation);
+      return;
+    }
+    if (view.status !== 'pending' || view.me.status !== 'pending') return;
+    locationPermission().then((permission) => {
+      if (permission === 'granted') requestLocation(10000).then((answer) => recordViewLocation(withApproximate(answer)));
+      else if (permission === 'denied') recordViewLocation({ shared: false, reason: 'declined' });
+      // 'prompt', or a browser that can't locate (e.g. a phone opening the link over plain http): ask the person
+      else setAskLocation(true);
+    });
+  }, [view]);
+
+  const shareLocation = async () => {
+    setLocationBusy(true);
+    // They chose to share: if the device can't find its position, record an approximate one instead
+    const answer = await requestLocation(15000);
+    // An unanswered browser prompt after clicking "Share location" still counts as agreeing
+    await recordViewLocation('shared' in answer && answer.reason === 'skipped' ? { approximate: true } : withApproximate(answer));
+    setLocationBusy(false);
+  };
+
+  const skipLocation = () => recordViewLocation({ shared: false, reason: 'declined' });
+
+  /** Location sent with a signature or decline: a fresh reading if allowed, otherwise why there is none. */
+  const actionLocation = () =>
+    locationForAction(viewLocation?.shared === true, viewLocation && !viewLocation.shared ? viewLocation.reason : 'skipped');
+
   const handleFinish = async () => {
     if (!view || !signatureUrl || !placed.some((t) => t.type === 'signature')) return;
     setIsSubmitting(true);
@@ -204,6 +263,7 @@ export const PublicSigningPage: React.FC<{ token: string }> = ({ token }) => {
             scale: t.scale,
             signatureDataUrl: t.type === 'signature' ? signatureUrl : undefined,
           })),
+          location: await actionLocation(),
         }),
       });
       const data = await res.json();
@@ -225,7 +285,7 @@ export const PublicSigningPage: React.FC<{ token: string }> = ({ token }) => {
       const res = await fetch(`/api/sign/${token}/decline`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ reason: declineReason }),
+        body: JSON.stringify({ reason: declineReason, location: await actionLocation() }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Could not decline the document.');
@@ -311,6 +371,13 @@ export const PublicSigningPage: React.FC<{ token: string }> = ({ token }) => {
           <p className="text-sm text-zinc-400">
             Everyone has signed. A copy of the fully signed document has been emailed to you
             {view.transactionId ? ` (transaction ID ${view.transactionId})` : ''}.
+          </p>
+        ) : view.isSender && view.senderSignsFirst ? (
+          <p className="text-sm text-zinc-400">
+            Your signature is saved, and the document has now been sent to{' '}
+            {(view.signingOrder === 'sequential' ? remaining.slice(0, 1) : remaining).map((s) => s.name).join(', ')}
+            {view.signingOrder === 'sequential' && remaining.length > 1 ? ', then the others in order' : ''}. You will get
+            the fully signed document by email when everyone has signed.
           </p>
         ) : (
           <p className="text-sm text-zinc-400">
@@ -548,6 +615,37 @@ export const PublicSigningPage: React.FC<{ token: string }> = ({ token }) => {
         </span>
       </div>
 
+      {askLocation && !viewLocation && (
+        <div className="px-3 sm:px-6 py-2.5 border-b border-zinc-800 bg-cyan-500/5 flex flex-wrap items-center gap-x-3 gap-y-2 text-xs shrink-0" role="region" aria-label="Share your location">
+          <MapPin className="w-4 h-4 text-cyan-400 shrink-0" aria-hidden="true" />
+          <span className="flex-1 min-w-48 text-zinc-300">
+            Share your location for the signing record? It's optional, and only {view.sender.name} and the audit trail will show it.
+          </span>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={shareLocation}
+              disabled={locationBusy}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded bg-cyan-500 hover:bg-cyan-400 text-zinc-950 font-semibold cursor-pointer disabled:opacity-50"
+            >
+              {locationBusy ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <MapPin className="w-3.5 h-3.5" />}
+              <span>{locationBusy ? 'Waiting for your browser…' : 'Share location'}</span>
+            </button>
+            <button
+              onClick={skipLocation}
+              disabled={locationBusy}
+              className="px-3 py-1.5 rounded border border-zinc-700 text-zinc-300 hover:text-white cursor-pointer disabled:opacity-50"
+            >
+              Not now
+            </button>
+          </div>
+        </div>
+      )}
+      {viewLocation && (
+        <div className="px-3 sm:px-6 py-1.5 border-b border-zinc-800 text-[11px] text-zinc-400 shrink-0">
+          <LocationText location={viewLocation} label="Your location for this record:" />
+        </div>
+      )}
+
       {view.aiSummary && (
         <details className="px-3 sm:px-6 py-2 border-b border-zinc-800 text-xs shrink-0">
           <summary className="cursor-pointer font-medium text-cyan-300">
@@ -597,7 +695,7 @@ export const PublicSigningPage: React.FC<{ token: string }> = ({ token }) => {
 
       <footer className="px-3 py-2 border-t border-zinc-800 text-[10px] text-zinc-500 flex items-center justify-center gap-1.5 shrink-0">
         <ShieldCheck className="w-3 h-3" />
-        <span>Signing with QuickSign. Your signature, the time, and your IP address are recorded in the document's audit trail.</span>
+        <span>Signing with QuickSign. Your signature, the time, your IP address and, if you share it, your location are recorded in the document's audit trail.</span>
       </footer>
 
       <SignatureModal
